@@ -1,0 +1,128 @@
+// Triaina standard library examples from the language design draft.
+
+gate(`2`) hs {
+  (+, +) >> -;
+  (-, -) >> +;
+  (+, -) >> 0;
+  (-, +) >> 0;
+  (+, 0) >> +;
+  (-, 0) >> -;
+  (0, +) >> +;
+  (0, -) >> -;
+  (?, ?) >> 0; // exhausted wildcard: only (0,0) remains
+}
+
+gate(`3`) carry {
+  (+, +, +) >> +;
+  (+, +, 0) >> +;
+  (+, 0, +) >> +;
+  (0, +, +) >> +;
+  (-, -, -) >> -;
+  (-, -, 0) >> -;
+  (-, 0, -) >> -;
+  (0, -, -) >> -;
+  (?, ?, ?) >> 0;
+}
+
+gate(`1`) rot {
+  (-) >> 0;
+  (0) >> +;
+  (+) >> -;
+}
+
+gate(`1`) neg {
+  (+) >> -;
+  (0) >> 0;
+  (-) >> +;
+}
+
+block(in left:?n, in right:?m, out res:(n + m))
+cat {
+  left % right >> res;
+}
+
+block(in a:1, in b:1, out r:1, out s:2)
+wiring_demo
+with(hs h) {
+  |a, b| >> h;
+  h.out >> r;
+  a % b >> s;
+}
+
+block(in left:1, in right:1, out result:1)
+combine
+with(hs first, rot second) {
+  |left, right| >> first >> second >> result;
+}
+
+block(in t:1, in q:1, out next:1)
+counter_next {
+  match t % q {
+    0_ >> q;      // hold
+    -_ >> 0;      // reset
+    _  >> rot(q); // step
+  } >> next;
+}
+
+block(in a:1, in b:1, in cin:1, out sum:1, out cout:1)
+full_adder
+with(hs hs_ab, hs hs_c, carry cr) {
+  |a, b| >> hs_ab;
+  |hs_ab.out, cin| >> hs_c;
+  a >> cr.in.0;
+  b >> cr.in.1;
+  cin >> cr.in.2;
+  hs_c >> sum;
+  cr >> cout;
+}
+
+block(in x:2, in y:2, out sum:2)
+adder2
+with(full_adder fa0, full_adder fa1) {
+  |x[0], y[0], 0| >> fa0;
+  |x[1], y[1], fa0.out.1| >> fa1;
+  fa1.out.0 % fa0.out.0 >> sum;
+}
+
+block(in en:1, out sda:1)
+open_drain {
+  match en {
+    - >> 0;  // enabled: pull low
+    _ >> z;  // disabled: released
+  } >> sda;
+}
+
+block(in a:1, in b:1, in c:1, out sda:1)
+i2c_sda
+with(open_drain oa, open_drain ob, open_drain oc) {
+  a >> oa.in.0;
+  b >> ob.in.0;
+  c >> oc.in.0;
+  |oa.out, ob.out, oc.out| >> merge >> sda; // idle u, any enable low, all enabled agree on 0
+}
+
+block(in s:1, out q:1)
+latch {
+  match s {
+    + >> +;
+    - >> -;
+    _ >> q;
+  } >> q;
+}
+
+block(out q:1, out nq:1)
+ring
+with(neg g1, neg g2) {
+  @wq >> g1;
+  g1 >> @nq >> g2;
+  g2 >> @wq >> q;
+  @nq >> nq;
+}
+
+block(in t:1, in clk:1, out q:1)
+counter
+with(register(0) state) {
+  |t, state.out| >> counter_next >> state.in.0;
+  clk >> state.in.1;
+  state.out >> q;
+}

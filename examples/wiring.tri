@@ -1,0 +1,35 @@
+// Wiring, composition and latch examples from the design draft.
+import "lib.tri";
+
+test("wiring_demo table") wiring_demo {
+  (|+, +|) >> (| -, ++|);
+  (|-, 0|) >> (| -, -0|);
+}
+
+test("combine table") combine {
+  (|+, +|) >> (| 0 |);   // hs(+,+) = -, rot(-) = 0
+  (|+, 0|) >> (| - |);   // hs(+,0) = +, rot(+) = -
+}
+
+test("cat table") cat {
+  (|+, 00|) >> (| +00 |);
+  (|-u, +0z|) >> (| -u+0z |);
+}
+
+input('s') s_key;
+output("Q") q_out;
+
+test("latch set/hold") until `12` with(latch l) {
+  script {
+    `0`:  s +;
+    `5`:  s u;
+    `8`:  s -;
+  }
+  s >> l.in.0;
+  l.out >> q_out;
+  expect {
+    `0`:  init Q u;
+    `0`:  post Q +;
+    `8`:  post Q -;
+  }
+}

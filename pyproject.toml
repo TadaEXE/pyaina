@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "triaina"
+version = "0.1.0"
+description = "Triaina: functional block diagram language over balanced ternary signals with a discrete tick scheduler"
+requires-python = ">=3.9"
+
+[tool.setuptools]
+packages = ["triaina"]
