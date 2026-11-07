@@ -1,0 +1,35 @@
+// Counter bench and tests from the specification (sections 5, 6 and 8).
+import "lib.tri";
+
+bench("count") with(counter ff) {
+  input('t') t_key;
+  clock(50, 50) sys_clk;
+  output("Q") q_out;
+
+  t_key >> ff.in.0;
+  sys_clk >> ff.in.1;
+  ff.out >> q_out;
+}
+
+test("full_adder table") full_adder {
+  (|+, 0, -|) >> (|0, 0|);
+  (|+, +, +|) >> (|0, +|);
+  (|-, -, -|) >> (|0, -|);
+  (|+, +, 0|) >> (|-, +|);
+}
+
+test("counter steps") until 100 with(counter ff) {
+  clock(50, 50) sys_clk;
+  output("Q") q_out;
+  script {
+    0:  t 0;
+    20: t +;
+    45: t 0;
+  }
+  t >> ff.in.0;
+  sys_clk >> ff.in.1;
+  ff.out >> q_out;
+  expect {
+    25: Q +;
+  }
+}

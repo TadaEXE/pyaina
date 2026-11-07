@@ -1,0 +1,79 @@
+// Wiring, adapters, sharing, multi-driver resolution, feedback, namespaces.
+import "lib.tri";
+
+test("combine_pair table") combine_pair {
+  (|+, +|) >> (|-|);
+  (|+, 0|) >> (|+|);
+  (|-, 0|) >> (|-|);
+}
+
+test("join_pair table") join_pair {
+  (|+ , -|) >> (|+-|);
+  (|u, +|) >> (|u+|);
+}
+
+test("adapter_demo table") adapter_demo {
+  // x = hs(c, a), y = hs(b, a)
+  (|+, 0, -|) >> (|0, +|);
+  (|-, +, +|) >> (|0, 0|);
+}
+
+test("sharing_demo table") sharing_demo {
+  // x = rot(a), y = hs(rot(a), b)
+  (|+, -|) >> (|- , +|);
+  (|0, +|) >> (|+ , -|);
+}
+
+test("forward table") forward {
+  (|+u0|) >> (|+u0|);
+  (|00|) >> (|00|);
+}
+
+test("widen table") widen {
+  (|++|) >> (|0++|);
+  (|-0|) >> (|0-0|);
+}
+
+test("slicer table") slicer {
+  (|+0-u|) >> (|-u, +0, u-0+|);
+}
+
+test("invert table") circuits::demo::invert {
+  (|+|) >> (|-|);
+  (|0|) >> (|0|);
+  (|-|) >> (|+|);
+}
+
+test("latch set/hold") until 12 with(latch l) {
+  output("Q") q_out;
+  script {
+    0: s +;
+    5: s 0;
+    8: s -;
+  }
+  s >> l.in.0;
+  l.out >> q_out;
+  expect {
+    0: Q +;
+    8: Q -;
+  }
+}
+
+test("shared pull low") until 6 with(shared_pull_low sp) {
+  output("B") bus_out;
+  script {
+    0: a +;
+    2: a 0;
+    3: b +;
+    5: b 0;
+  }
+  a >> sp.in.0;
+  b >> sp.in.1;
+  sp.out >> bus_out;
+  expect {
+    0: B 0;
+    2: B u;
+    3: B 0;
+    5: B u;
+  }
+}

@@ -1,0 +1,134 @@
+// Triaina library: gates and blocks taken from the language specification.
+
+gate(1) rot {
+  (-) >> 0;
+  (0) >> +;
+  (+) >> -;
+}
+
+gate(2) hs {
+  (+, +) >> -;
+  (-, -) >> +;
+  (+, -) >> 0;
+  (-, +) >> 0;
+  (+, 0) >> +;
+  (-, 0) >> -;
+  (0, +) >> +;
+  (0, -) >> -;
+  (_, _) >> 0;
+}
+
+gate(3) carry {
+  (+, +, +) >> +;
+  (+, +, 0) >> +;
+  (+, 0, +) >> +;
+  (0, +, +) >> +;
+  (-, -, -) >> -;
+  (-, -, 0) >> -;
+  (-, 0, -) >> -;
+  (0, -, -) >> -;
+  (_, _, _) >> 0;
+}
+
+gate(1) pull_low {
+  (+) >> 0;
+  (_) >> z;
+}
+
+gate(2) latch_logic {
+  (+, _) >> +;
+  (-, _) >> -;
+  (0, -) >> -;
+  (0, 0) >> 0;
+  (0, +) >> +;
+}
+
+gate(2) counter_logic {
+  (-, _) >> 0;
+  (0, -) >> -;
+  (0, 0) >> 0;
+  (0, +) >> +;
+  (+, -) >> 0;
+  (+, 0) >> +;
+  (+, +) >> -;
+}
+
+block(in a:1, in b:1, out result:1)
+combine_pair {
+  |a, b| >> hs >> result;
+}
+
+block(in a:1, in b:1, out result:2)
+join_pair {
+  a % b >> result;
+}
+
+block(in a:1, in b:1, in cin:1, out sum:1, out cout:1)
+full_adder {
+  |a, b| >> hs >> @ab;
+  |@ab.0, cin| >> hs >> sum;
+  |a, b, cin| >> carry >> cout;
+}
+
+block(in s:1, out q:1)
+latch {
+  |s, q| >> latch_logic >> q;
+}
+
+block(in enable_a:1, in enable_b:1, out bus:1)
+shared_pull_low {
+  enable_a >> pull_low >> bus;
+  enable_b >> pull_low >> bus;
+}
+
+block(in a:1, in b:1, in c:1, out x:1, out y:1)
+adapter_demo {
+  |a, b, c| >> @signals:(1, 1, 1);
+  @signals >> |$2, $0| >> hs >> x;
+  @signals >> |@signals.1, $0| >> hs >> y;
+}
+
+block(in a:1, in b:1, out x:1, out y:1)
+sharing_demo {
+  a >> rot >> @shifted >> x;
+  |@shifted.0, b| >> hs >> y;
+}
+
+block(in value:?n, out result:?n)
+forward {
+  value >> @signal:n >> result;
+}
+
+block(in v:?n, out wide:(n + 1))
+widen {
+  0 % v >> wide;
+}
+
+block(in v:4, out lo:2, out hi:2, out rev:4)
+slicer {
+  v[0:2] >> lo;
+  v[2:4] >> hi;
+  v[:-1] >> rev;
+}
+
+block(in t:1, in clk:1, out q:1)
+counter
+with(register(0) state) {
+  |t, state.out| >> counter_logic >> state.in.0;
+  clk >> state.in.1;
+  state.out >> q;
+}
+
+namespace logic {
+  gate(1) neg {
+    (-) >> +;
+    (0) >> 0;
+    (+) >> -;
+  }
+}
+
+namespace circuits::demo {
+  block(in value:1, out result:1) invert {
+    value >> ::logic::neg >> result;
+  }
+}
