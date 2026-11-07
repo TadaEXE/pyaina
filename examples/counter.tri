@@ -1,11 +1,11 @@
-// Counter bench + tests from the design draft (sections 8 and 10).
+// Counter bench and tests from the specification (sections 5, 6 and 8).
 import "lib.tri";
 
-input('t') t_key;
-clock(`50`, `50`) sys_clk;
-output("Q") q_out;
-
 bench("count") with(counter ff) {
+  input('t') t_key;
+  clock(50, 50) sys_clk;
+  output("Q") q_out;
+
   t_key >> ff.in.0;
   sys_clk >> ff.in.1;
   ff.out >> q_out;
@@ -18,23 +18,18 @@ test("full_adder table") full_adder {
   (|+, +, 0|) >> (|-, +|);
 }
 
-test("adder2 table") adder2 {
-  (|00, 00|) >> (|00|);
-  (|+0, 0+|) >> (|++|);
-  (|--, ++|) >> (|00|);
-}
-
-test("counter steps on +") until `100` with(counter ff) {
+test("counter steps") until 100 with(counter ff) {
+  clock(50, 50) sys_clk;
+  output("Q") q_out;
   script {
-    `0`:  t 0;
-    `20`: t +;
-    `45`: t 0;
+    0:  t 0;
+    20: t +;
+    45: t 0;
   }
   t >> ff.in.0;
   sys_clk >> ff.in.1;
   ff.out >> q_out;
   expect {
-    `0`:  Q 0;
-    `25`: Q +;
+    25: Q +;
   }
 }

@@ -1,114 +1,115 @@
 # Triaina
 
-An implementation of **Triaina**, a functional block-diagram language over
-balanced ternary signals (`-`, `0`, `+`, plus `u` unknown, `e` fault, `z`
-released), with a discrete **tick scheduler**: one tick is exactly one
-scheduler step — apply sources, evaluate each queued node once against the
-post-source/pre-commit snapshot, commit all outputs simultaneously, and
-queue consumers of changed observations for the next tick. There is no
-simulated physical time and no relaxation to a fixed point.
-
-Implemented per the design draft "Triaina: Functional Block Diagram
-Language" (revision 3, tick scheduler).
+An implementation of **Triaina**, a declarative functional block-diagram
+language for balanced ternary circuits, per the *Triaina — Language
+Specification*. Gates define logic, blocks compose circuits, and connections
+carry signals between ports. The compiler fixes circuit topology and widths;
+the runtime evaluates affected computational nodes in discrete ticks.
 
 ## Usage
 
 ```bash
-python3 -m triaina list  examples/counter.tri     # list benches and tests
-python3 -m triaina test  examples/counter.tri     # run all tests in the import closure
+python3 -m triaina list  examples/counter.tri     # benches and tests in the import closure
+python3 -m triaina test  examples/counter.tri     # run all tests
 python3 -m triaina run   examples/counter.tri --bench count --ticks 101 --events ev.txt
+python3 -m triaina repl  examples/counter.tri --bench count   # interactive terminal host
 ```
 
-`ev.txt` assigns input events to tick indices, one per line:
+`ev.txt` holds tick-indexed replay records, one per line: `TICK KEY VALUE`
+(e.g. `20 t +`). Output records print as `TICK LABEL: VALUE`, e.g.:
 
 ```
-20 t +
-45 t 0
+-1 Q: 0
+25 Q: +
 ```
 
-Output records are printed as `TICK PHASE LABEL: VALUE`, e.g.:
+The first record is the tick `-1` initialization snapshot; tick `0` performs
+the first evaluation.
 
-```
-0 init Q: 0
-25 post Q: +
-```
+## Language coverage
 
-Run `python3 -m triaina run --help` for `--until-idle` / `--max-ticks`.
+- Six-state trits (`- 0 + u e z`); adjacent symbols form vector literals
+  (`+u0z`); longest-token lexing favors literals (`uez` is a literal, `use`
+  is an identifier); `u`, `e`, `z` are reserved.
+- Widths `:4`, `:?`, `:?n`, `:(n + 1)` as exact-rational numeric expressions;
+  literal widths, port declarations, register initializers and named-connection
+  annotations constrain inference; unresolved widths are compile errors; a
+  shorter vector zero-extends on the left (added trits are driven `0`) when
+  connected to a wider destination, longer ones require explicit selection.
+- `a % b` concatenation (rightmost trit has index 0), `v[i]`, half-open
+  `v[lo:hi]` (result index 0 = `v[lo]`), `v[:-1]` reversal.
+- Gates `gate(N)` with truth tables over `- 0 + _` (wildcard), rows in source
+  order, full coverage required, exhausted wildcard rows permitted, results
+  may be `- 0 + z`. Positionwise lifting with zero-extension, `e` dominance,
+  and independent per-position unknown enumeration (a unanimous result —
+  including `z` — is emitted, else `u`). One stateless node and one
+  computational tick per gate stage in a `>>` chain.
+- Chains `>>` with flat member bundles; inline adapters `|$2, $0, +, @s.1[0:2]|`
+  select/reorder/duplicate/omit/insert members and preserve driver identity;
+  named connections `@name` (one declaration, arbitrary references, forward
+  references allowed) with width annotations `@single:4`, `@bus:(1, 4, 2)`;
+  `@name`, `@name.0`, `@name.0[2]`.
+- Connections may have multiple output contributors, resolved trit-wise:
+  `e`/conflict -> `e` (contention diagnostics name drivers and trit indices),
+  else any `u` -> `u`, else agreeing actives, all-`z`/none -> `u`. Wiring
+  statements sharing an endpoint join the participating connections. Resolution
+  adds no tick.
+- Blocks with ports, `with(Type name, ...)` instances (named references share
+  the instance; anonymous occurrences are new instances), `instance.in.N` /
+  `instance.out.N` / `instance.out`, no recursive instantiation. Block
+  boundaries forward connections and preserve attached drivers. Classification:
+  combinational / feedback / clocked (a block may be both clocked and
+  feedback-containing); register outputs break combinational dependency paths.
+- Tick scheduler: deduplicated current/next queues; tick `k` applies input
+  events and clock transitions, evaluates each queued node once against the
+  post-source snapshot, commits simultaneously, resolves and queues consumers
+  of changed resolved values for `k+1`, then emits post-tick observations.
+  Initialization is tick `-1` (inputs default `0`, clocks `-`, registers use
+  their initializers, gate outputs `u`); every gate enters the first queue.
+  Only changes to resolved five-state values schedule consumers.
+- `clock(P, D)`: `H = P*D/100`, `L = P-H` positive integers, first rising edge
+  at tick `L`, first falling at `P`. `register(init)` samples pre-commit data
+  on rising `-`->`+` edges; its clock input must trace through transparent
+  routing to a single clock generator.
+- Benches declare their endpoints locally: `input('k')`, `input('k', +u0)`,
+  `clock(50, 50)`, `output("Q")` / `output("Q", every_step)`. Keyboard records
+  are the key plus exactly the source width's trits (`t+`); malformed records
+  are diagnosed without changing the input. Multiple events on one tick: last
+  in record order wins. `changes` emits the tick-`-1` snapshot plus changes;
+  `every_step` also emits after every tick; records carry tick, name, value,
+  declaration order.
+- Tests: table tests (fresh instance per row, run to idle, combinational
+  blocks only) and sequential tests (`until N`, `script`/`expect`, inclusive
+  final tick, expectations exclude the tick-`-1` snapshot).
+- Namespaces: `namespace logic { ... }`, `namespace outer::inner { ... }`,
+  `logic::name`, `::logic::name`, reopenable, C++-style lookup through
+  enclosing namespaces; `import "name.tri"` (acyclic, no re-export, duplicate
+  qualified definitions and ambiguous references are diagnostics); benches and
+  tests are discoverable throughout the import closure.
+- Runtime API: `step()`, `advance(n)`, `inject(key, value)` (assigned to a
+  later tick boundary), `outputs()`, `diagnostics()`, `subscribe(cb)`,
+  `tick`, paced execution (`run_paced`, `Pacer` start/pause/stop; a requested
+  interval is the minimum target between tick starts and every tick completes
+  fully). The `repl` command is a minimal interactive terminal host.
 
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests    # 60 unit tests
-python3 -m triaina test examples/counter.tri examples/wiring.tri  # doc examples
+python3 -m unittest discover -s tests    # conformance suite
+python3 -m triaina test examples/counter.tri examples/wiring.tri
 ```
-
-## Language coverage
-
-- Six-state trits; literals concatenate (`++-0`, `+u0z`); longest-token
-  lexing favors literals (`uez` is a literal, `use` is an identifier);
-  `u`, `e`, `z` are reserved.
-- Widths: `:4` fixed, `:?` inferred, `:?n` parametric, `:(n + m)` computed
-  from exact rationals; anchored inference with backward anchoring at
-  declared destinations; short values zero-extend on the left at
-  fixed-width destinations (extension inserts driven `0`).
-- Concatenation `%` (written order), indexing `v[i]`, slicing `v[lo:hi]`
-  (index 0 = rightmost), reversal `v[:-1]`.
-- Gates: truth tables with `?` wildcards and ordered exhaustion, positionwise
-  lifting with zero-extension, `e` dominance, independent per-position
-  unknown enumeration (unanimous result wins, else `u`); gates never emit `z`.
-- Chains routed with `>>`; inline adapters `|$1, $0, +|`, `$0[1:3]`,
-  `@ctrl.0`; named connections `@name` (forward references, fan-out, width
-  annotations `@w:1`); single-driver rule (short circuits are compile
-  errors).
-- `merge`: the only meeting point of contributions and the only raw-`z`
-  reader — fault, unknown, agreement, floating rules, contention reported
-  as `e` with provenance.
-- Blocks (the only component form), `with(...)` named instances, anonymous
-  occurrences, positional calls of combinational components, `match`
-  (first match, `?`, one `_` per pattern, mandatory final `_` arm, arms may
-  drive `z`), `fold(g)`.
-- Derived block classification (combinational / feedback / clocked),
-  transitive; table tests only for combinational blocks; calls restricted
-  to combinational components.
-- Cyclic and cross-coupled circuits are first class; connections retain
-  their last committed value; no settling, no oscillation detector.
-- Registers `register(init)` with `data`/`clk`/`out`, rising-edge sampling
-  of the pre-commit snapshot; clock generators `clock(`P`, `D`)` in integer
-  ticks (rise at `L = P - P*D/100`, fall at `P`, repeat); clock eligibility
-  by origin tracing through transparent routing only.
-- Benches and endpoints: `input('k')`, `input('k', +u0z)`, `output("Q")`,
-  `output("Q", every_step)`; emission modes `changes` (default) and
-  `every_step`; records carry tick index, phase (`init`/`post`) and
-  sequence.
-- Tests: table tests (fresh network per row, run to idle) and sequential
-  tests (`script`/`expect`/`until N`, tick-indexed).
-- Files and `import "name.tri";`: acyclic, no re-export, name-collision
-  diagnostics, entrypoint discovery over the whole import closure.
-- Diagnostics with provenance: `e` carries tick-indexed origins (literal,
-  external, contention with contributing ports); provenance propagates
-  through routing/gates/registers without inventing faults and affects
-  queueing but not signal equality or `changes` emission.
-
-### Known limitations of this first implementation
-
-- `using` (compile-time component parameters) is parsed but rejected with a
-  diagnostic — the design draft marks it open for the first implementation.
-- Forward references to *multi-member* named chains are not supported (use
-  `@name.N` member access).
-- `run until idle` is available as a host command with a mandatory tick
-  bound (`--until-idle --max-ticks N`), as the draft requires.
 
 ## Layout
 
 ```
 triaina/
-  lexer.py      six-state lexer with numeric (backtick/:/[]) contexts
+  lexer.py      context-free lexer (numeric vs signal decided by the parser)
   parser.py     recursive-descent parser -> ast_nodes.py
-  compiler.py   imports, name resolution, width solver, classification,
-                clock-origin tracing, graph building
-  runtime.py    sources, nets, nodes, the tick scheduler, emission
-  host.py       bench runner, table/sequential test runner
-  cli.py        list / run / test
-tests/          unittest suite
-examples/       .tri files taken from the design draft
+  compiler.py   imports/namespaces, width solver, classification, clock-origin
+                tracing, graph building
+  runtime.py    connections, sources, nodes, the tick scheduler, emission, API
+  host.py       bench runner, keyboard/tick-indexed input, test runner
+  cli.py        list / run / test / repl
+tests/          conformance suite
+examples/       .tri files taken from the specification
 ```

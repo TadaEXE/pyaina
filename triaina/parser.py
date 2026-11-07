@@ -1,9 +1,16 @@
-"""Recursive-descent parser for Triaina."""
+"""Recursive-descent parser for Triaina.
+
+Numeric contexts (width annotations, slice bounds, gate arity, clock args,
+`until`, script/expect tick indices) accept integer literals, width
+parameters, parentheses, unary +/- and binary + - * /; the lexer's LITERAL
+token `0` is read as integer 0 and single-char LITERALs `+`/`-` as operators
+there. Signal contexts read them as trits.
+"""
 
 from fractions import Fraction
 
 from . import ast_nodes as A
-from .lexer import lex, lex_numexpr
+from .lexer import lex
 
 
 class ParseError(Exception):
@@ -47,23 +54,33 @@ class Parser:
 
     def parse_num_add(self):
         left = self.parse_num_mul()
-        while self.cur.kind == 'NUMOP' and self.cur.value in '+-':
-            op = self.next().value
-            right = self.parse_num_mul()
-            left = A.NumBinary(op, left, right, left.line)
-        return left
+        while True:
+            t = self.cur
+            if t.kind == 'LITERAL' and t.value in ('+', '-'):
+                op = self.next().value
+                right = self.parse_num_mul()
+                left = A.NumBinary(op, left, right, t.line)
+            else:
+                return left
 
     def parse_num_mul(self):
         left = self.parse_num_unary()
-        while self.cur.kind == 'NUMOP' and self.cur.value in '*/':
-            op = self.next().value
-            right = self.parse_num_unary()
-            left = A.NumBinary(op, left, right, left.line)
-        return left
+        while True:
+            t = self.cur
+            if t.kind == 'STAR':
+                self.next()
+                right = self.parse_num_unary()
+                left = A.NumBinary('*', left, right, t.line)
+            elif t.kind == 'SLASH':
+                self.next()
+                right = self.parse_num_unary()
+                left = A.NumBinary('/', left, right, t.line)
+            else:
+                return left
 
     def parse_num_unary(self):
         t = self.cur
-        if t.kind == 'NUMOP' and t.value in '+-':
+        if t.kind == 'LITERAL' and t.value in ('+', '-'):
             op = self.next().value
             operand = self.parse_num_unary()
             return A.NumUnary(op, operand, t.line)
@@ -74,44 +91,60 @@ class Parser:
         if t.kind == 'NUM':
             self.next()
             return A.NumLit(Fraction(t.value), t.line)
-        if t.kind == 'PARAM':
+        if t.kind == 'LITERAL' and t.value and all(c == '0' for c in t.value):
+            self.next()
+            return A.NumLit(Fraction(int(t.value)), t.line)
+        if t.kind == 'IDENT':
             self.next()
             return A.NumParam(t.value, t.line)
-        if t.kind == 'NUMOP' and t.value == '(':
+        if t.kind == 'LPAREN':
             self.next()
             e = self.parse_numexpr()
-            t2 = self.cur
-            if t2.kind != 'NUMOP' or t2.value != ')':
-                raise ParseError('line %d: expected )' % t.line)
-            self.next()
+            self.expect('RPAREN', ')')
             return e
         raise ParseError('line %d: expected numeric expression, got %s %r' % (
             t.line, t.kind, t.value))
 
-    def parse_backtick(self):
-        t = self.expect('NUMEXPR', 'backtick numeric')
-        sub = Parser(lex_numexpr(t.value, t.line, t.col))
-        e = sub.parse_numexpr()
-        if sub.cur.kind != 'EOF':
-            raise ParseError('line %d: trailing tokens in numeric %r' % (t.line, t.value))
-        return e
+    def tok_int(self, what='index'):
+        t = self.cur
+        if t.kind == 'NUM':
+            self.next()
+            return t.value
+        if t.kind == 'LITERAL' and t.value and all(c == '0' for c in t.value):
+            self.next()
+            return int(t.value)
+        raise ParseError('line %d: expected %s, got %s %r' % (t.line, what, t.kind, t.value))
 
     # ---- widths and slices ----
 
     def parse_widthspec(self):
-        """Called right after COLON. Returns WidthSpec."""
+        """After COLON: `:4` | `:?` | `:?n` | `:(n + 1)` | `:n`."""
         t = self.cur
         if t.kind == 'QMARK':
             self.next()
             name = None
-            if self.cur.kind == 'PARAM':
+            if self.cur.kind == 'IDENT':
                 name = self.next().value
             return A.WidthSpec('param' if name else 'inferred', name=name, line=t.line)
         e = self.parse_numexpr()
         return A.WidthSpec('const', expr=e, line=t.line)
 
+    def parse_width_annotation(self):
+        """After COLON in a `@name:...` annotation: single widthspec or a
+        tuple `@name:(1, 4, 2)`."""
+        t = self.cur
+        if t.kind == 'LPAREN':
+            self.next()
+            items = [self.parse_widthspec()]
+            while self.cur.kind == 'COMMA':
+                self.next()
+                items.append(self.parse_widthspec())
+            self.expect('RPAREN', ')')
+            return A.WidthSpec('tuple', items=items, line=t.line)
+        return self.parse_widthspec()
+
     def parse_slice(self):
-        """Called right after LBRACKET. Returns SliceSpec."""
+        """After LBRACKET: v[i] | v[lo:hi] | v[:-1] | v[:]."""
         t = self.cur
         lo = hi = None
         if self.cur.kind not in ('COLON', 'RBRACKET'):
@@ -120,13 +153,11 @@ class Parser:
             self.next()
             if self.cur.kind != 'RBRACKET':
                 hi = self.parse_numexpr()
-        else:
-            if lo is not None:
-                # v[i] selects the single trit i, i.e. [i:i+1]
-                hi = A.NumBinary('+', lo, A.NumLit(Fraction(1), lo.line), lo.line)
+        elif lo is not None:
+            # v[i] selects the single trit i, i.e. [i:i+1]
+            hi = A.NumBinary('+', lo, A.NumLit(Fraction(1), lo.line), lo.line)
         self.expect('RBRACKET', "']'")
         return A.SliceSpec(lo, hi, t.line)
-
 
     def parse_slice_opt(self):
         if self.cur.kind == 'LBRACKET':
@@ -134,32 +165,38 @@ class Parser:
             return self.parse_slice()
         return None
 
-    # ---- patterns ----
+    # ---- qualified names ----
 
-    def parse_pattern_items(self):
-        """One or more pattern positions (no commas)."""
-        items = []
-        while True:
-            t = self.cur
-            if t.kind == 'LITERAL':
-                self.next()
-                for ch in t.value:
-                    items.append(('lit', ch))
-            elif t.kind == 'QMARK':
-                self.next()
-                items.append(('any',))
-            elif t.kind == 'UNDERSCORE':
-                self.next()
-                items.append(('seq',))
-            else:
-                break
-        if not items:
-            t = self.cur
-            raise ParseError('line %d: empty pattern' % t.line)
-        return items
+    def parse_qname(self):
+        """[::] ident (:: ident)* -> (absolute, parts)."""
+        t = self.cur
+        absolute = False
+        if t.kind == 'DCOLON':
+            self.next()
+            absolute = True
+        parts = [self.expect('IDENT', 'name').value]
+        while self.cur.kind == 'DCOLON':
+            self.next()
+            parts.append(self.expect('IDENT', 'name').value)
+        return absolute, parts
 
-    def parse_pattern(self):
-        return self.parse_pattern_items()
+    # ---- gate patterns ----
+
+    def parse_pattern_item(self):
+        t = self.cur
+        if t.kind == 'LITERAL':
+            self.next()
+            items = []
+            for ch in t.value:
+                if ch not in '-0+':
+                    raise ParseError('line %d: gate pattern positions are - 0 + or _, got %r'
+                                     % (t.line, ch))
+                items.append(('lit', ch))
+            return items
+        if t.kind == 'UNDERSCORE':
+            self.next()
+            return [('any',)]
+        raise ParseError('line %d: bad gate pattern item %s %r' % (t.line, t.kind, t.value))
 
     # ---- references and expressions ----
 
@@ -170,55 +207,36 @@ class Parser:
             member = None
             if self.cur.kind == 'DOT':
                 self.next()
-                member = self.expect('NUM', 'member index').value
-            return A.Ref('named', t.value, member=member, line=t.line)
+                member = self.tok_int('member index')
+            return A.Ref('named', [t.value], member=member, line=t.line)
         if t.kind == 'IDENT':
             self.next()
             if self.cur.kind == 'DOT':
                 self.next()
                 f = self.expect('IDENT', 'in/out')
                 if f.value not in ('in', 'out'):
-                    raise ParseError('line %d: expected in/out after dot, got %r' % (
-                        f.line, f.value))
+                    raise ParseError('line %d: expected in/out after dot, got %r'
+                                     % (f.line, f.value))
                 index = None
                 if self.cur.kind == 'DOT':
                     self.next()
-                    index = self.expect('NUM', 'port index').value
-                return A.Ref('qual', t.value, field=f.value, index=index, line=t.line)
-            return A.Ref('bare', t.value, line=t.line)
+                    index = self.tok_int('port index')
+                return A.Ref('qual', [t.value], field=f.value, index=index, line=t.line)
+            return A.Ref('bare', [t.value], line=t.line)
         raise ParseError('line %d: expected reference, got %s %r' % (t.line, t.kind, t.value))
 
     def parse_primary(self):
         t = self.cur
         if t.kind == 'LITERAL':
             self.next()
-            sl = self.parse_slice_opt()
-            return A.LitExpr(t.value, slice=sl, line=t.line)
-        if t.kind == 'AT':
+            return A.LitExpr(t.value, slice=self.parse_slice_opt(), line=t.line)
+        if t.kind == 'AT' or t.kind == 'IDENT':
             ref = self.parse_ref()
-            sl = self.parse_slice_opt()
-            return A.RefExpr(ref, slice=sl, line=t.line)
-        if t.kind == 'IDENT' and t.value == 'match':
-            return self.parse_match()
-        if t.kind == 'IDENT' and self.peek().kind == 'LPAREN':
-            name = self.next().value
-            self.expect('LPAREN')
-            args = []
-            if self.cur.kind != 'RPAREN':
-                args.append(self.parse_expr())
-                while self.cur.kind == 'COMMA':
-                    self.next()
-                    args.append(self.parse_expr())
-            self.expect('RPAREN')
-            return A.CallExpr(name, args, t.line)
-        if t.kind == 'IDENT':
-            ref = self.parse_ref()
-            sl = self.parse_slice_opt()
-            return A.RefExpr(ref, slice=sl, line=t.line)
+            return A.RefExpr(ref, slice=self.parse_slice_opt(), line=t.line)
         if t.kind == 'LPAREN':
             self.next()
             e = self.parse_expr()
-            self.expect('RPAREN')
+            self.expect('RPAREN', ')')
             return e
         raise ParseError('line %d: expected expression, got %s %r' % (t.line, t.kind, t.value))
 
@@ -230,22 +248,6 @@ class Parser:
         if len(parts) == 1:
             return parts[0]
         return A.ConcatExpr(parts, parts[0].line)
-
-    def parse_match(self):
-        t = self.expect('IDENT')  # 'match'
-        sel = self.parse_expr()
-        self.expect('LBRACE')
-        arms = []
-        while self.cur.kind != 'RBRACE':
-            pat = self.parse_pattern()
-            self.expect('RARROW', '>> in match arm')
-            e = self.parse_expr()
-            self.expect('SEMI')
-            arms.append((pat, e))
-        self.expect('RBRACE')
-        if not arms:
-            raise ParseError('line %d: match needs arms' % t.line)
-        return A.MatchExpr(sel, arms, t.line)
 
     # ---- chain segments ----
 
@@ -262,15 +264,13 @@ class Parser:
             member = None
             if self.cur.kind == 'DOT':
                 self.next()
-                member = self.expect('NUM', 'member index').value
+                member = self.tok_int('member index')
             base = ('named', t.value, member)
         elif t.kind == 'IDENT':
-            ref = self.parse_ref()
-            base = ('ref', ref)
+            base = ('ref', self.parse_ref())
         else:
             raise ParseError('line %d: bad adapter member %s %r' % (t.line, t.kind, t.value))
-        sl = self.parse_slice_opt()
-        return A.AdapterMember(base, slice=sl, line=t.line)
+        return A.AdapterMember(base, slice=self.parse_slice_opt(), line=t.line)
 
     def parse_segment(self):
         t = self.cur
@@ -280,51 +280,53 @@ class Parser:
             while self.cur.kind == 'COMMA':
                 self.next()
                 members.append(self.parse_adapter_member())
-            self.expect('PIPE')
+            self.expect('PIPE', '|')
             return A.AdapterSeg(members, t.line)
         if t.kind == 'AT':
+            if self.peek().kind in ('DOT', 'LBRACKET'):
+                return A.ExprSeg(self.parse_primary(), t.line)
             self.next()
-            width = None
+            widths = None
             if self.cur.kind == 'COLON':
                 self.next()
-                width = self.parse_widthspec()
-            return A.NamedSeg(t.value, width=width, line=t.line)
+                widths = self.parse_width_annotation()
+            return A.NamedSeg(t.value, widths=widths, line=t.line)
+        if t.kind in ('LITERAL', 'LPAREN'):
+            return A.ExprSeg(self.parse_expr(), t.line)
+        if t.kind == 'DCOLON':
+            absolute, parts = self.parse_qname()
+            return A.QNameSeg(parts, absolute=absolute, line=t.line)
         if t.kind == 'IDENT':
-            if t.value == 'merge' and self.peek().kind != 'LPAREN':
-                self.next()
-                return A.MergeSeg(t.line)
-            if t.value == 'fold' and self.peek().kind == 'LPAREN':
-                self.next()
-                self.expect('LPAREN')
-                g = self.expect('IDENT', 'gate name')
-                self.expect('RPAREN')
-                return A.FoldSeg(g.value, t.line)
-            if t.value == 'match':
-                return A.ExprSeg(self.parse_match(), t.line)
-            if self.peek().kind in ('LPAREN', 'PERCENT', 'LBRACKET'):
-                return A.ExprSeg(self.parse_expr(), t.line)
+            if self.peek().kind == 'DCOLON':
+                absolute, parts = self.parse_qname()
+                return A.QNameSeg(parts, absolute=absolute, line=t.line)
             if self.peek().kind == 'DOT':
-                self.next()
+                name = self.next().value
                 self.expect('DOT')
                 f = self.expect('IDENT', 'in/out')
                 if f.value not in ('in', 'out'):
-                    raise ParseError('line %d: expected in/out after dot' % f.line)
+                    raise ParseError('line %d: expected in/out after dot, got %r'
+                                     % (f.line, f.value))
                 index = None
                 if self.cur.kind == 'DOT':
                     self.next()
-                    index = self.expect('NUM', 'port index').value
-                if self.cur.kind == 'PERCENT':
-                    ref = A.Ref('qual', t.value, field=f.value, index=index, line=t.line)
+                    index = self.tok_int('port index')
+                if self.cur.kind in ('PERCENT', 'LBRACKET'):
+                    ref = A.Ref('qual', [name], field=f.value, index=index, line=t.line)
                     parts = [A.RefExpr(ref, line=t.line)]
                     while self.cur.kind == 'PERCENT':
                         self.next()
                         parts.append(self.parse_primary())
-                    return A.ExprSeg(A.ConcatExpr(parts, t.line), t.line)
-                return A.QualSeg(t.value, f.value, index, t.line)
+                    expr = parts[0] if len(parts) == 1 else A.ConcatExpr(parts, t.line)
+                    if self.cur.kind == 'LBRACKET':
+                        raise ParseError('line %d: slice of a concatenation is not supported'
+                                         % t.line)
+                    return A.ExprSeg(expr, t.line)
+                return A.QualSeg(name, f.value, index, t.line)
+            if self.peek().kind in ('PERCENT', 'LBRACKET'):
+                return A.ExprSeg(self.parse_expr(), t.line)
             self.next()
             return A.BareSeg(t.value, t.line)
-        if t.kind in ('LITERAL', 'LPAREN'):
-            return A.ExprSeg(self.parse_expr(), t.line)
         raise ParseError('line %d: bad chain segment %s %r' % (t.line, t.kind, t.value))
 
     def parse_connection(self):
@@ -333,26 +335,123 @@ class Parser:
         while self.cur.kind == 'RARROW':
             self.next()
             segs.append(self.parse_segment())
-        self.expect('SEMI')
+        self.expect('SEMI', ';')
         return A.Connection(segs, t.line)
 
     # ---- bodies ----
 
+    def parse_input(self):
+        t = self.expect('IDENT')  # input
+        self.expect('LPAREN')
+        key = self.expect('QSTRING', 'input key')
+        init = None
+        if self.cur.kind == 'COMMA':
+            self.next()
+            init = self.expect('LITERAL', 'initializer').value
+        self.expect('RPAREN')
+        name = self.expect('IDENT', 'input name')
+        self.expect('SEMI')
+        return A.InputDef(key.value, name.value, init, t.line)
+
+    def parse_output(self):
+        t = self.expect('IDENT')  # output
+        self.expect('LPAREN')
+        label = self.expect('QSTRING', 'output label')
+        mode = 'changes'
+        if self.cur.kind == 'COMMA':
+            self.next()
+            m = self.expect('IDENT', 'emission mode')
+            if m.value not in ('changes', 'every_step'):
+                raise ParseError('line %d: bad emission mode %r' % (m.line, m.value))
+            mode = m.value
+        self.expect('RPAREN')
+        name = self.expect('IDENT', 'output name')
+        self.expect('SEMI')
+        return A.OutputDef(label.value, name.value, mode, t.line)
+
+    def parse_clock(self):
+        t = self.expect('IDENT')  # clock
+        self.expect('LPAREN')
+        period = self.parse_numexpr()
+        self.expect('COMMA')
+        duty = self.parse_numexpr()
+        self.expect('RPAREN')
+        name = self.expect('IDENT', 'clock name')
+        self.expect('SEMI')
+        return A.ClockDef(name.value, period, duty, t.line)
+
+    def parse_script_block(self):
+        t = self.expect('IDENT')  # script
+        self.expect('LBRACE')
+        recs = []
+        while self.cur.kind != 'RBRACE':
+            tick = self.parse_numexpr()
+            self.expect('COLON', ':')
+            key = self.expect('IDENT', 'input key')
+            val = self.expect('LITERAL', 'input value')
+            self.expect('SEMI')
+            recs.append(A.ScriptRec(tick, key.value, val.value, t.line))
+        self.expect('RBRACE')
+        return recs
+
+    def parse_expect_block(self):
+        t = self.expect('IDENT')  # expect
+        self.expect('LBRACE')
+        recs = []
+        while self.cur.kind != 'RBRACE':
+            tick = self.parse_numexpr()
+            self.expect('COLON', ':')
+            label = self.expect('IDENT', 'output label')
+            val = self.expect('LITERAL', 'expected value')
+            self.expect('SEMI')
+            recs.append(A.ExpectRec(tick, label.value, val.value, t.line))
+        self.expect('RBRACE')
+        return recs
+
+    def parse_body(self, allow_endpoints=False, allow_script_expect=False):
+        self.expect('LBRACE')
+        stmts = []
+        script = []
+        expect = []
+        while self.cur.kind != 'RBRACE':
+            t = self.cur
+            if t.kind == 'IDENT' and allow_endpoints and t.value == 'input':
+                stmts.append(self.parse_input())
+                continue
+            if t.kind == 'IDENT' and allow_endpoints and t.value == 'output':
+                stmts.append(self.parse_output())
+                continue
+            if t.kind == 'IDENT' and allow_endpoints and t.value == 'clock':
+                stmts.append(self.parse_clock())
+                continue
+            if t.kind == 'IDENT' and allow_script_expect and t.value == 'script':
+                script.extend(self.parse_script_block())
+                continue
+            if t.kind == 'IDENT' and allow_script_expect and t.value == 'expect':
+                expect.extend(self.parse_expect_block())
+                continue
+            stmts.append(self.parse_connection())
+        self.expect('RBRACE')
+        return stmts, script, expect
+
+    # ---- definitions ----
+
     def parse_with(self):
-        self.expect('IDENT')  # 'with'
+        t = self.expect('IDENT')  # with
         self.expect('LPAREN')
         items = []
         while True:
-            tt = self.expect('IDENT', 'type name')
-            if tt.value == 'register':
+            absolute, parts = self.parse_qname()
+            if parts == ['register'] and not absolute:
                 self.expect('LPAREN')
                 lit = self.expect('LITERAL', 'register initializer')
                 self.expect('RPAREN')
                 name = self.expect('IDENT', 'instance name')
-                items.append(A.WithItem('register', name.value, init=lit.value, line=tt.line))
+                items.append(A.WithItem(parts, name.value, init=lit.value,
+                                        absolute=absolute, line=t.line))
             else:
                 name = self.expect('IDENT', 'instance name')
-                items.append(A.WithItem(tt.value, name.value, line=tt.line))
+                items.append(A.WithItem(parts, name.value, absolute=absolute, line=t.line))
             if self.cur.kind == 'COMMA':
                 self.next()
                 continue
@@ -360,125 +459,10 @@ class Parser:
         self.expect('RPAREN')
         return items
 
-    def parse_body(self, allow_script_expect=False):
-        self.expect('LBRACE')
-        stmts = []
-        script = []
-        expect = []
-        while self.cur.kind != 'RBRACE':
-            t = self.cur
-            if allow_script_expect and t.kind == 'IDENT' and t.value == 'script':
-                self.next()
-                self.expect('LBRACE')
-                while self.cur.kind != 'RBRACE':
-                    tick = self.parse_backtick()
-                    self.expect('COLON')
-                    key = self.expect('IDENT', 'input key')
-                    val = self.expect('LITERAL', 'input value')
-                    self.expect('SEMI')
-                    script.append(A.ScriptRec(tick, key.value, val.value, t.line))
-                self.expect('RBRACE')
-                continue
-            if allow_script_expect and t.kind == 'IDENT' and t.value == 'expect':
-                self.next()
-                self.expect('LBRACE')
-                while self.cur.kind != 'RBRACE':
-                    tick = self.parse_backtick()
-                    self.expect('COLON')
-                    phase = None
-                    if self.cur.kind == 'IDENT' and self.cur.value in ('init', 'post'):
-                        phase = self.next().value
-                    label = self.expect('IDENT', 'output label')
-                    val = self.expect('LITERAL', 'expected value')
-                    self.expect('SEMI')
-                    expect.append(A.ExpectRec(tick, phase, label.value, val.value, t.line))
-                self.expect('RBRACE')
-                continue
-            stmts.append(self.parse_connection())
-        self.expect('RBRACE')
-        return stmts, script, expect
-
-    # ---- top level ----
-
-    def parse_file(self):
-        defs = []
-        while self.cur.kind != 'EOF':
-            t = self.cur
-            if not (t.kind == 'IDENT'):
-                raise ParseError('line %d: unexpected top-level %s %r' % (t.line, t.kind, t.value))
-            word = t.value
-            if word == 'import':
-                self.next()
-                path = self.expect('QSTRING', 'import path')
-                self.expect('SEMI')
-                d = A.Import(path.value, t.line)
-                defs.append(d)
-                continue
-            if word == 'gate':
-                defs.append(self.parse_gate())
-                continue
-            if word == 'block':
-                defs.append(self.parse_block())
-                continue
-            if word == 'input':
-                self.next()
-                self.expect('LPAREN')
-                key = self.expect('QSTRING', 'input key')
-                init = None
-                if self.cur.kind == 'COMMA':
-                    self.next()
-                    init = self.expect('LITERAL', 'initializer').value
-                self.expect('RPAREN')
-                name = self.expect('IDENT', 'input name')
-                self.expect('SEMI')
-                defs.append(A.InputDef(key.value, name.value, init, t.line))
-                continue
-            if word == 'output':
-                self.next()
-                self.expect('LPAREN')
-                label = self.expect('QSTRING', 'output label')
-                mode = 'changes'
-                if self.cur.kind == 'COMMA':
-                    self.next()
-                    m = self.expect('IDENT', 'emission mode')
-                    if m.value not in ('changes', 'every_step'):
-                        raise ParseError('line %d: bad emission mode %r' % (m.line, m.value))
-                    mode = m.value
-                self.expect('RPAREN')
-                name = self.expect('IDENT', 'output name')
-                self.expect('SEMI')
-                defs.append(A.OutputDef(label.value, name.value, mode, t.line))
-                continue
-            if word == 'clock':
-                self.next()
-                self.expect('LPAREN')
-                period = self.parse_backtick()
-                self.expect('COMMA')
-                duty = self.parse_backtick()
-                self.expect('RPAREN')
-                name = self.expect('IDENT', 'clock name')
-                self.expect('SEMI')
-                defs.append(A.ClockDef(name.value, period, duty, t.line))
-                continue
-            if word == 'bench':
-                self.next()
-                self.expect('LPAREN')
-                name = self.expect('QSTRING', 'bench name')
-                self.expect('RPAREN')
-                with_items = self.parse_with() if self.at_kw('with') else []
-                body, _, _ = self.parse_body()
-                defs.append(A.BenchDef(name.value, with_items, body, t.line))
-                continue
-            if word == 'test':
-                defs.append(self.parse_test())
-                continue
-            raise ParseError('line %d: unexpected top-level keyword %r' % (t.line, word))
-        return defs
-
     def parse_gate(self):
         t = self.expect('IDENT')  # gate
         self.expect('LPAREN')
-        arity = self.parse_backtick()
+        arity = self.parse_numexpr()
         self.expect('RPAREN')
         name = self.expect('IDENT', 'gate name')
         self.expect('LBRACE')
@@ -486,20 +470,18 @@ class Parser:
         while self.cur.kind != 'RBRACE':
             self.expect('LPAREN')
             items = []
-            while True:
-                if self.cur.kind == 'RPAREN':
-                    break
-                items.extend(self.parse_pattern_items())
+            while self.cur.kind != 'RPAREN':
+                items.extend(self.parse_pattern_item())
                 if self.cur.kind == 'COMMA':
                     self.next()
                     continue
                 break
             self.expect('RPAREN')
-            self.expect('RARROW')
+            self.expect('RARROW', '>> in gate row')
             res = self.expect('LITERAL', 'gate result')
-            if len(res.value) != 1 or res.value not in '-0+':
-                raise ParseError('line %d: gate result must be one of - 0 +, got %r' % (
-                    res.line, res.value))
+            if len(res.value) != 1 or res.value not in '-0+z':
+                raise ParseError('line %d: gate result must be one of - 0 + z, got %r'
+                                 % (res.line, res.value))
             self.expect('SEMI')
             rows.append((items, res.value))
         self.expect('RBRACE')
@@ -518,9 +500,7 @@ class Parser:
             if d.value not in ('in', 'out'):
                 raise ParseError('line %d: expected in/out, got %r' % (d.line, d.value))
             name = self.expect('IDENT', 'port name')
-            if self.cur.kind != 'COLON':
-                raise ParseError('line %d: expected : after port name' % name.line)
-            self.next()
+            self.expect('COLON', ':')
             w = self.parse_widthspec()
             ports.append(A.Port(d.value, name.value, w, d.line))
             if self.cur.kind == 'COMMA':
@@ -534,21 +514,18 @@ class Parser:
         t = self.expect('IDENT')  # block
         ports = self.parse_ports()
         name = self.expect('IDENT', 'block name')
-        using = None
-        if self.at_kw('using'):
-            self.next()
-            self.expect('LPAREN')
-            using = []
-            while True:
-                using.append(self.expect('IDENT', 'using param').value)
-                if self.cur.kind == 'COMMA':
-                    self.next()
-                    continue
-                break
-            self.expect('RPAREN')
         with_items = self.parse_with() if self.at_kw('with') else []
-        body, _, _ = self.parse_body()
-        return A.BlockDef(name.value, ports, using, body, with_items=with_items, line=t.line)
+        body, _, _ = self.parse_body(allow_endpoints=False)
+        return A.BlockDef(name.value, ports, with_items, body, t.line)
+
+    def parse_bench(self):
+        t = self.expect('IDENT')  # bench
+        self.expect('LPAREN')
+        name = self.expect('QSTRING', 'bench name')
+        self.expect('RPAREN')
+        with_items = self.parse_with() if self.at_kw('with') else []
+        body, _, _ = self.parse_body(allow_endpoints=True)
+        return A.BenchDef(name.value, with_items, body, t.line)
 
     def parse_test(self):
         t = self.expect('IDENT')  # test
@@ -557,28 +534,72 @@ class Parser:
         self.expect('RPAREN')
         if self.at_kw('until'):
             self.next()
-            until = self.parse_backtick()
+            until = self.parse_numexpr()
             with_items = self.parse_with() if self.at_kw('with') else []
-            body, script, expect = self.parse_body(allow_script_expect=True)
+            body, script, expect = self.parse_body(allow_endpoints=True,
+                                                   allow_script_expect=True)
             return A.TestDef(name.value, until=until, script=script, expect=expect,
                              with_items=with_items, body=body, line=t.line)
-        target = self.expect('IDENT', 'target block')
+        absolute, parts = self.parse_qname()
         self.expect('LBRACE')
         rows = []
         while self.cur.kind != 'RBRACE':
             self.expect('LPAREN')
-            ins = [self.parse_segment()]
+            ins = self.parse_segment()
             self.expect('RPAREN')
-            self.expect('RARROW')
+            self.expect('RARROW', '>> in test row')
             self.expect('LPAREN')
-            outs = [self.parse_segment()]
+            outs = self.parse_segment()
             self.expect('RPAREN')
             self.expect('SEMI')
             rows.append(A.TableRow(ins, outs, t.line))
         self.expect('RBRACE')
         if not rows:
             raise ParseError('line %d: table test needs rows' % t.line)
-        return A.TestDef(name.value, target=target.value, rows=rows, line=t.line)
+        return A.TestDef(name.value, target=(parts, absolute), rows=rows, line=t.line)
+
+    def parse_namespace(self):
+        t = self.expect('IDENT')  # namespace
+        absolute, parts = self.parse_qname()
+        if absolute:
+            raise ParseError('line %d: namespace name cannot be absolute' % t.line)
+        self.expect('LBRACE')
+        defs = []
+        while self.cur.kind != 'RBRACE':
+            defs.append(self.parse_toplevel())
+        self.expect('RBRACE')
+        return A.NamespaceDef(parts, defs, t.line)
+
+    def parse_toplevel(self):
+        t = self.cur
+        if t.kind != 'IDENT':
+            raise ParseError('line %d: unexpected top-level %s %r' % (t.line, t.kind, t.value))
+        word = t.value
+        if word == 'import':
+            self.next()
+            path = self.expect('QSTRING', 'import path')
+            self.expect('SEMI')
+            return A.Import(path.value, t.line)
+        if word == 'namespace':
+            return self.parse_namespace()
+        if word == 'gate':
+            return self.parse_gate()
+        if word == 'block':
+            return self.parse_block()
+        if word == 'bench':
+            return self.parse_bench()
+        if word == 'test':
+            return self.parse_test()
+        if word in ('input', 'output', 'clock'):
+            raise ParseError('line %d: %s declarations are only allowed inside a bench '
+                             'or test body' % (t.line, word))
+        raise ParseError('line %d: unexpected top-level keyword %r' % (t.line, word))
+
+    def parse_file(self):
+        defs = []
+        while self.cur.kind != 'EOF':
+            defs.append(self.parse_toplevel())
+        return defs
 
 
 def parse_text(text, file='<string>'):
